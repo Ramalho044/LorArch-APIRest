@@ -1,57 +1,95 @@
+# azure-pipelines-aci.yml
 trigger:
   branches:
     include:
       - master
       - main
 
+pr:
+  branches:
+    include:
+      - master
+      - main
+
+name: $(Date:yyyyMMdd).$(Rev:r)
+
 pool:
   vmImage: 'ubuntu-latest'
 
 variables:
-  appName: 'myassist554611'
-  acrName: 'acrlorch'
-  acrLoginServer: 'acrlorch.azurecr.io'
-  imageRepository: 'fiap/$(appName)'
-  dockerRegistryServiceConnection: 'sc-acr-lorch'
-  azureServiceConnection: 'sc-azure-lorch'
+  # App/Infra
+  appName: 'lorarch-app'           # pode manter o seu, só não use maiúsculas
   resourceGroup: 'LorArch'
   location: 'eastus'
+  # ACR
+  acrName: 'acrlorch'
+  acrLoginServer: 'acrlorch.azurecr.io'
+  imageRepository: 'fiap/lorarch'
+  dockerRegistryServiceConnection: 'sc-acr-lorch'
+  # Azure RM connection
+  azureServiceConnection: 'sc-azure-lorch'
 
 stages:
 # =========================
-# CI: build + testes + artefato + imagem
+# CI: build + testes + cobertura + artefato + imagem
 # =========================
-- stage: Build
-  displayName: 'CI - Build, Test, Docker build/push'
+- stage: CI
+  displayName: 'CI — Build, Test, Coverage, Docker build/push'
   jobs:
-    - job: ci
-      displayName: 'Gradle build & test'
+    - job: build_and_push
+      displayName: 'Gradle + Docker'
       steps:
         - checkout: self
           fetchDepth: 1
 
-        - task: UseJavaVersion@1
+        # Evita o erro "UseJavaVersion@1" usando a task estável
+        - task: JavaToolInstaller@0
+          displayName: 'Configurar Java 21'
           inputs:
             versionSpec: '21'
-            architecture: 'x64'
+            jdkArchitectureOption: 'x64'
             jdkSourceOption: 'PreInstalled'
 
+        # Cache do Gradle acelera os builds
         - task: Cache@2
           displayName: 'Cache Gradle'
           inputs:
             key: 'gradle | "$(Agent.OS)" | **/gradle-wrapper.properties'
-            restoreKeys: 'gradle | "$(Agent.OS)"'
-            path: ~/.gradle/caches
+            restoreKeys: |
+              gradle | "$(Agent.OS)"
+            path: ~/.gradle
 
         - script: chmod +x ./gradlew
           displayName: 'Permissão gradlew'
 
-        - script: ./gradlew test --no-daemon
-          displayName: 'Testes unitários'
+        # Roda testes com perfil 'test' para não depender de Oracle na FIAP
+        - script: ./gradlew clean test jacocoTestReport --no-daemon
+          displayName: 'Testes + Jacoco'
+          env:
+            SPRING_PROFILES_ACTIVE: 'test'
 
+        # Publica resultados de teste e cobertura
+        - task: PublishTestResults@2
+          displayName: 'Publicar testes (JUnit)'
+          inputs:
+            testResultsFormat: 'JUnit'
+            testResultsFiles: '**/TEST-*.xml'
+            searchFolder: '$(System.DefaultWorkingDirectory)'
+            failTaskOnFailedTests: true
+
+        - task: PublishCodeCoverageResults@2
+          displayName: 'Publicar cobertura (Jacoco)'
+          inputs:
+            codeCoverageTool: 'JaCoCo'
+            summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/build/reports/jacoco/test/jacocoTestReport.xml'
+            reportDirectory: '$(System.DefaultWorkingDirectory)/**/build/reports/jacoco/test/html'
+            failIfCoverageEmpty: false
+
+        # Gera o JAR para empacotar na imagem
         - script: ./gradlew bootJar --no-daemon
           displayName: 'Build JAR'
 
+        # Mantém artefato para auditoria
         - bash: |
             set -e
             JAR=$(ls build/libs/*.jar | head -n1)
@@ -60,59 +98,51 @@ stages:
           displayName: 'Preparar artefato app.jar'
 
         - task: PublishBuildArtifacts@1
+          displayName: 'Publicar artefato (drop/app.jar)'
           inputs:
             pathToPublish: 'drop'
             artifactName: 'drop'
-          displayName: 'Publicar artefato (app.jar)'
+            publishLocation: 'Container'
 
+        # Build & Push no ACR (tag = buildId e latest)
         - task: Docker@2
-          displayName: 'Docker build & push para ACR'
+          displayName: 'Docker build & push → ACR'
           inputs:
             containerRegistry: '$(dockerRegistryServiceConnection)'
             repository: '$(imageRepository)'
             command: 'buildAndPush'
             Dockerfile: 'Dockerfile'
-            buildContext: '.'
+            buildContext: '$(System.DefaultWorkingDirectory)'
             tags: |
               $(Build.BuildId)
-            arguments: '--build-arg JAR_FILE=drop/app.jar'
+              latest
 
 # =========================
-# CD: deploy no ACI + health-check
+# CD: deploy no Azure Container Instances (ACI) + health-check
 # =========================
-- stage: Deploy
-  displayName: 'CD - Deploy no Azure Container Instance'
-  dependsOn: Build
+- stage: CD
+  displayName: 'CD — Deploy no Azure Container Instance'
+  dependsOn: CI
   condition: succeeded()
   jobs:
-    - job: deploy
-      displayName: 'Criar/Atualizar ACI'
+    - job: deploy_aci
+      displayName: 'Deploy + Health-check'
       steps:
-        - task: DownloadBuildArtifacts@1
-          displayName: 'Baixar artefato (caso queira validar)'
-          inputs:
-            buildType: 'current'
-            downloadType: 'single'
-            artifactName: 'drop'
-            downloadPath: '$(Pipeline.Workspace)'
-
         - task: AzureCLI@2
-          displayName: 'Deploy no ACI + health-check'
+          displayName: 'Criar/Atualizar ACI e validar'
           inputs:
             azureSubscription: '$(azureServiceConnection)'
-            scriptType: 'bash'
-            scriptLocation: 'inlineScript'
+            scriptType: bash
+            scriptLocation: inlineScript
             inlineScript: |
               set -e
-
-              echo "Login no ACR..."
-              az acr login --name $(acrName)
 
               IMAGE="$(acrLoginServer)/$(imageRepository):$(Build.BuildId)"
               DNS_LABEL="$(echo $(appName) | tr '[:upper:]' '[:lower:]')"
 
-              echo "Criando/atualizando container $(appName) com imagem ${IMAGE}"
-              # cria ou atualiza (delete/replace se já existir)
+              echo "Usando imagem: ${IMAGE}"
+
+              # Se já existir, substitui
               if az container show -g $(resourceGroup) -n $(appName) &>/dev/null; then
                 az container delete -g $(resourceGroup) -n $(appName) --yes
               fi
@@ -124,33 +154,39 @@ stages:
                 --image ${IMAGE} \
                 --cpu 1 \
                 --memory 1.5 \
-                --dns-name-label ${DNS_LABEL} \
-                --ports 8080 \
                 --restart-policy Always \
-                --environment-variables DB_URL=$(DB_URL) DB_USER=$(DB_USER) \
-                --secure-environment-variables DB_PASSWORD=$(DB_PASSWORD) \
-                --registry-login-server $(acrLoginServer)
+                --ports 8080 \
+                --dns-name-label ${DNS_LABEL} \
+                --registry-login-server $(acrLoginServer) \
+                --environment-variables \
+                    SPRING_PROFILES_ACTIVE=prod \
+                    SPRING_JPA_HIBERNATE_DDL_AUTO=update \
+                    SERVER_PORT=8080 \
+                --secure-environment-variables \
+                    SPRING_DATASOURCE_URL=$(DB_URL) \
+                    SPRING_DATASOURCE_USERNAME=$(DB_USER) \
+                    SPRING_DATASOURCE_PASSWORD=$(DB_PASSWORD)
 
-              echo "Aguardando iniciar..."
-              for i in {1..30}; do
+              echo "Aguardando container ficar Running..."
+              for i in {1..40}; do
                 STATE=$(az container show -g $(resourceGroup) -n $(appName) --query "instanceView.state" -o tsv)
                 echo "Estado: $STATE"
                 [ "$STATE" = "Running" ] && break
-                sleep 7
+                sleep 6
               done
 
               FQDN=$(az container show -g $(resourceGroup) -n $(appName) --query "ipAddress.fqdn" -o tsv)
               echo "FQDN: $FQDN"
+              echo "##vso[task.setvariable variable=aciFqdn;isOutput=true]$FQDN"
 
-              echo "Health-check em http://$FQDN:8080/actuator/health"
+              echo "Health-check em /actuator/health"
               for i in {1..30}; do
                 code=$(curl -s -o /dev/null -w "%{http_code}" "http://$FQDN:8080/actuator/health" || true)
-                echo "Tentativa $i - HTTP $code"
-                [ "$code" = "200" ] && echo "Health OK" && exit 0
-                sleep 7
+                echo "Tentativa $i -> $code"
+                [ "$code" = "200" ] && exit 0
+                sleep 5
               done
 
-              echo "Health-check falhou."
-              # logs de diagnóstico
+              echo "Logs do container:"
               az container logs -g $(resourceGroup) -n $(appName) || true
               exit 1
