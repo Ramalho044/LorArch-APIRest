@@ -1,127 +1,156 @@
-# =========================
-# Azure DevOps Pipeline – CI/CD
-# Build Docker + Push ACR + Deploy ACI + Health Check
-# =========================
-
 trigger:
   branches:
     include:
       - master
       - main
 
-name: $(Date:yyyyMMdd).$(Rev:r)
-
 pool:
   vmImage: 'ubuntu-latest'
 
-# Variáveis da pipeline (não duplique este bloco em outro lugar do YAML)
 variables:
-  appName: 'myassist554611'               # nome do container/hostname
-  resourceGroup: 'LorArch'
-  location: 'eastus'
-  port: '8080'
-
-  # ACR
+  appName: 'myassist554611'
   acrName: 'acrlorch'
   acrLoginServer: 'acrlorch.azurecr.io'
   imageRepository: 'fiap/$(appName)'
-  imageTag: '$(Build.BuildId)'
-
-  # Service Connections (já criados no projeto)
   dockerRegistryServiceConnection: 'sc-acr-lorch'
   azureServiceConnection: 'sc-azure-lorch'
+  resourceGroup: 'LorArch'
+  location: 'eastus'
 
 stages:
-# ====================================================
-# STAGE 1 — Build da imagem e Push para o ACR (CI)
-# ====================================================
+# =========================
+# CI: build + testes + artefato + imagem
+# =========================
 - stage: Build
-  displayName: 'Build & Push para ACR'
+  displayName: 'CI - Build, Test, Docker build/push'
   jobs:
-    - job: docker_build_push
-      displayName: 'Gerar e enviar imagem Docker'
+    - job: ci
+      displayName: 'Gradle build & test'
       steps:
+        - checkout: self
+          fetchDepth: 1
+
+        - task: UseJavaVersion@1
+          inputs:
+            versionSpec: '21'
+            architecture: 'x64'
+            jdkSourceOption: 'PreInstalled'
+
+        - task: Cache@2
+          displayName: 'Cache Gradle'
+          inputs:
+            key: 'gradle | "$(Agent.OS)" | **/gradle-wrapper.properties'
+            restoreKeys: 'gradle | "$(Agent.OS)"'
+            path: ~/.gradle/caches
+
+        - script: chmod +x ./gradlew
+          displayName: 'Permissão gradlew'
+
+        - script: ./gradlew test --no-daemon
+          displayName: 'Testes unitários'
+
+        - script: ./gradlew bootJar --no-daemon
+          displayName: 'Build JAR'
+
+        - bash: |
+            set -e
+            JAR=$(ls build/libs/*.jar | head -n1)
+            mkdir -p drop
+            cp "$JAR" drop/app.jar
+          displayName: 'Preparar artefato app.jar'
+
+        - task: PublishBuildArtifacts@1
+          inputs:
+            pathToPublish: 'drop'
+            artifactName: 'drop'
+          displayName: 'Publicar artefato (app.jar)'
+
         - task: Docker@2
-          displayName: 'Docker buildAndPush'
+          displayName: 'Docker build & push para ACR'
           inputs:
             containerRegistry: '$(dockerRegistryServiceConnection)'
             repository: '$(imageRepository)'
             command: 'buildAndPush'
-            Dockerfile: '**/Dockerfile'
+            Dockerfile: 'Dockerfile'
+            buildContext: '.'
             tags: |
-              $(imageTag)
+              $(Build.BuildId)
+            arguments: '--build-arg JAR_FILE=drop/app.jar'
 
-        # publica um artefato "image_meta" só para deixar rastreável
-        - publish: $(Pipeline.Workspace)
-          artifact: image_meta
-          displayName: 'Publicar metadados de imagem (opcional)'
-          condition: always()
-
-# ====================================================
-# STAGE 2 — Deploy no Azure Container Instances (CD)
-# ====================================================
+# =========================
+# CD: deploy no ACI + health-check
+# =========================
 - stage: Deploy
-  displayName: 'Deploy no Azure Container Instance'
+  displayName: 'CD - Deploy no Azure Container Instance'
   dependsOn: Build
-  condition: succeeded('Build')
+  condition: succeeded()
   jobs:
-    - job: aci_deploy
-      displayName: 'Criar/atualizar ACI'
+    - job: deploy
+      displayName: 'Criar/Atualizar ACI'
       steps:
+        - task: DownloadBuildArtifacts@1
+          displayName: 'Baixar artefato (caso queira validar)'
+          inputs:
+            buildType: 'current'
+            downloadType: 'single'
+            artifactName: 'drop'
+            downloadPath: '$(Pipeline.Workspace)'
+
         - task: AzureCLI@2
-          displayName: 'az container create'
+          displayName: 'Deploy no ACI + health-check'
           inputs:
             azureSubscription: '$(azureServiceConnection)'
-            scriptType: bash
-            scriptLocation: inlineScript
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
             inlineScript: |
-              set -euo pipefail
+              set -e
 
-              IMG="$(acrLoginServer)/$(imageRepository):$(imageTag)"
-              echo "Imagem: $IMG"
-
-              echo "Login no ACR"
+              echo "Login no ACR..."
               az acr login --name $(acrName)
 
-              echo "Garantir Resource Group"
-              az group create -n $(resourceGroup) -l $(location) --only-show-errors 1>/dev/null
+              IMAGE="$(acrLoginServer)/$(imageRepository):$(Build.BuildId)"
+              DNS_LABEL="$(echo $(appName) | tr '[:upper:]' '[:lower:]')"
 
-              echo "Remover container anterior (se existir)"
+              echo "Criando/atualizando container $(appName) com imagem ${IMAGE}"
+              # cria ou atualiza (delete/replace se já existir)
               if az container show -g $(resourceGroup) -n $(appName) &>/dev/null; then
                 az container delete -g $(resourceGroup) -n $(appName) --yes
               fi
 
-              echo "Criar ACI"
               az container create \
-                -g $(resourceGroup) \
-                -n $(appName) \
-                --image "$IMG" \
+                --name $(appName) \
+                --resource-group $(resourceGroup) \
+                --location $(location) \
+                --image ${IMAGE} \
                 --cpu 1 \
                 --memory 1.5 \
-                --os-type Linux \
-                --registry-login-server $(acrLoginServer) \
-                --assign-identity \
-                --dns-name-label $(appName) \
-                --ports $(port) \
-                --environment-variables \
-                  DB_URL="$(DB_URL)" \
-                  DB_USER="$(DB_USER)" \
-                  DB_PASSWORD="$(DB_PASSWORD)"
+                --dns-name-label ${DNS_LABEL} \
+                --ports 8080 \
+                --restart-policy Always \
+                --environment-variables DB_URL=$(DB_URL) DB_USER=$(DB_USER) \
+                --secure-environment-variables DB_PASSWORD=$(DB_PASSWORD) \
+                --registry-login-server $(acrLoginServer)
 
-              echo "Aguardar ACI em Running"
-              az container wait -g $(resourceGroup) -n $(appName) \
-                --custom "instanceView.state=='Running'" \
-                --interval 10 --timeout 600
-
-              echo "Health check (30 tentativas)"
+              echo "Aguardando iniciar..."
               for i in {1..30}; do
-                if curl -fsS "http://$(appName).$(location).azurecontainer.io:$(port)/actuator/health" | grep -q '"status":"UP"'; then
-                  echo "Saúde OK";
-                  exit 0
-                fi
-                echo "Aguardando saúde... tent $i"; sleep 7
+                STATE=$(az container show -g $(resourceGroup) -n $(appName) --query "instanceView.state" -o tsv)
+                echo "Estado: $STATE"
+                [ "$STATE" = "Running" ] && break
+                sleep 7
               done
 
-              echo "Health check falhou. Logs do container:"
+              FQDN=$(az container show -g $(resourceGroup) -n $(appName) --query "ipAddress.fqdn" -o tsv)
+              echo "FQDN: $FQDN"
+
+              echo "Health-check em http://$FQDN:8080/actuator/health"
+              for i in {1..30}; do
+                code=$(curl -s -o /dev/null -w "%{http_code}" "http://$FQDN:8080/actuator/health" || true)
+                echo "Tentativa $i - HTTP $code"
+                [ "$code" = "200" ] && echo "Health OK" && exit 0
+                sleep 7
+              done
+
+              echo "Health-check falhou."
+              # logs de diagnóstico
               az container logs -g $(resourceGroup) -n $(appName) || true
               exit 1
