@@ -1,76 +1,59 @@
-# azure-pipelines-aci.yml
 trigger:
-  branches:
-    include:
-      - master
-      - main
-
+  branches: { include: [ master, main ] }
 pr:
-  branches:
-    include:
-      - master
-      - main
+  branches: { include: [ master, main ] }
 
+pool: { vmImage: 'ubuntu-latest' }
 name: $(Date:yyyyMMdd).$(Rev:r)
 
-pool:
-  vmImage: 'ubuntu-latest'
-
 variables:
-  # App/Infra
-  appName: 'lorarch-app'           # pode manter o seu, só não use maiúsculas
+  appName: 'lorarch-app'
   resourceGroup: 'LorArch'
   location: 'eastus'
-  # ACR
   acrName: 'acrlorch'
   acrLoginServer: 'acrlorch.azurecr.io'
   imageRepository: 'fiap/lorarch'
   dockerRegistryServiceConnection: 'sc-acr-lorch'
-  # Azure RM connection
   azureServiceConnection: 'sc-azure-lorch'
 
 stages:
-# =========================
-# CI: build + testes + cobertura + artefato + imagem
-# =========================
 - stage: CI
   displayName: 'CI — Build, Test, Coverage, Docker build/push'
   jobs:
-    - job: build_and_push
-      displayName: 'Gradle + Docker'
+    - job: build
       steps:
         - checkout: self
           fetchDepth: 1
 
-        # Evita o erro "UseJavaVersion@1" usando a task estável
         - task: JavaToolInstaller@0
-          displayName: 'Configurar Java 21'
+          displayName: 'Java 21'
           inputs:
             versionSpec: '21'
             jdkArchitectureOption: 'x64'
             jdkSourceOption: 'PreInstalled'
 
-        # Cache do Gradle acelera os builds
         - task: Cache@2
-          displayName: 'Cache Gradle'
           inputs:
             key: 'gradle | "$(Agent.OS)" | **/gradle-wrapper.properties'
-            restoreKeys: |
-              gradle | "$(Agent.OS)"
+            restoreKeys: gradle | "$(Agent.OS)"
             path: ~/.gradle
 
-        - script: chmod +x ./gradlew
-          displayName: 'Permissão gradlew'
+        # SQL Server real para testes
+        - bash: |
+            set -e
+            docker run -d --name mssql_ci -e 'ACCEPT_EULA=Y' -e 'MSSQL_SA_PASSWORD=Str0ng_Passw0rd!' -p 1433:1433 mcr.microsoft.com/mssql/server:2022-latest
+            for i in {1..30}; do
+              docker exec mssql_ci /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 'Str0ng_Passw0rd!' -Q "SELECT 1" && break
+              sleep 3
+            done
+            docker exec mssql_ci /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 'Str0ng_Passw0rd!' -Q "IF DB_ID('lorarch_ci') IS NULL CREATE DATABASE lorarch_ci;"
+          displayName: 'Subir SQL Server (CI)'
 
-        # Roda testes com perfil 'test' para não depender de Oracle na FIAP
         - script: ./gradlew clean test jacocoTestReport --no-daemon
-          displayName: 'Testes + Jacoco'
-          env:
-            SPRING_PROFILES_ACTIVE: 'test'
+          displayName: 'Testes + Jacoco (profile=ci)'
+          env: { SPRING_PROFILES_ACTIVE: 'ci' }
 
-        # Publica resultados de teste e cobertura
         - task: PublishTestResults@2
-          displayName: 'Publicar testes (JUnit)'
           inputs:
             testResultsFormat: 'JUnit'
             testResultsFiles: '**/TEST-*.xml'
@@ -78,33 +61,24 @@ stages:
             failTaskOnFailedTests: true
 
         - task: PublishCodeCoverageResults@2
-          displayName: 'Publicar cobertura (Jacoco)'
           inputs:
             codeCoverageTool: 'JaCoCo'
             summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/build/reports/jacoco/test/jacocoTestReport.xml'
             reportDirectory: '$(System.DefaultWorkingDirectory)/**/build/reports/jacoco/test/html'
             failIfCoverageEmpty: false
 
-        # Gera o JAR para empacotar na imagem
         - script: ./gradlew bootJar --no-daemon
           displayName: 'Build JAR'
 
-        # Mantém artefato para auditoria
         - bash: |
             set -e
             JAR=$(ls build/libs/*.jar | head -n1)
-            mkdir -p drop
-            cp "$JAR" drop/app.jar
-          displayName: 'Preparar artefato app.jar'
+            mkdir -p drop && cp "$JAR" drop/app.jar
+          displayName: 'Preparar artefato'
 
         - task: PublishBuildArtifacts@1
-          displayName: 'Publicar artefato (drop/app.jar)'
-          inputs:
-            pathToPublish: 'drop'
-            artifactName: 'drop'
-            publishLocation: 'Container'
+          inputs: { pathToPublish: 'drop', artifactName: 'drop' }
 
-        # Build & Push no ACR (tag = buildId e latest)
         - task: Docker@2
           displayName: 'Docker build & push → ACR'
           inputs:
@@ -117,32 +91,24 @@ stages:
               $(Build.BuildId)
               latest
 
-# =========================
-# CD: deploy no Azure Container Instances (ACI) + health-check
-# =========================
 - stage: CD
-  displayName: 'CD — Deploy no Azure Container Instance'
+  displayName: 'CD — Deploy no ACI + Health-check'
   dependsOn: CI
   condition: succeeded()
   jobs:
-    - job: deploy_aci
-      displayName: 'Deploy + Health-check'
+    - job: deploy
       steps:
         - task: AzureCLI@2
-          displayName: 'Criar/Atualizar ACI e validar'
+          displayName: 'Criar/Atualizar ACI'
           inputs:
             azureSubscription: '$(azureServiceConnection)'
             scriptType: bash
             scriptLocation: inlineScript
             inlineScript: |
               set -e
-
               IMAGE="$(acrLoginServer)/$(imageRepository):$(Build.BuildId)"
               DNS_LABEL="$(echo $(appName) | tr '[:upper:]' '[:lower:]')"
 
-              echo "Usando imagem: ${IMAGE}"
-
-              # Se já existir, substitui
               if az container show -g $(resourceGroup) -n $(appName) &>/dev/null; then
                 az container delete -g $(resourceGroup) -n $(appName) --yes
               fi
@@ -152,22 +118,19 @@ stages:
                 --resource-group $(resourceGroup) \
                 --location $(location) \
                 --image ${IMAGE} \
-                --cpu 1 \
-                --memory 1.5 \
+                --cpu 1 --memory 1.5 \
                 --restart-policy Always \
                 --ports 8080 \
                 --dns-name-label ${DNS_LABEL} \
                 --registry-login-server $(acrLoginServer) \
                 --environment-variables \
                     SPRING_PROFILES_ACTIVE=prod \
-                    SPRING_JPA_HIBERNATE_DDL_AUTO=update \
                     SERVER_PORT=8080 \
                 --secure-environment-variables \
                     SPRING_DATASOURCE_URL=$(DB_URL) \
                     SPRING_DATASOURCE_USERNAME=$(DB_USER) \
                     SPRING_DATASOURCE_PASSWORD=$(DB_PASSWORD)
 
-              echo "Aguardando container ficar Running..."
               for i in {1..40}; do
                 STATE=$(az container show -g $(resourceGroup) -n $(appName) --query "instanceView.state" -o tsv)
                 echo "Estado: $STATE"
@@ -177,16 +140,13 @@ stages:
 
               FQDN=$(az container show -g $(resourceGroup) -n $(appName) --query "ipAddress.fqdn" -o tsv)
               echo "FQDN: $FQDN"
-              echo "##vso[task.setvariable variable=aciFqdn;isOutput=true]$FQDN"
 
-              echo "Health-check em /actuator/health"
               for i in {1..30}; do
                 code=$(curl -s -o /dev/null -w "%{http_code}" "http://$FQDN:8080/actuator/health" || true)
-                echo "Tentativa $i -> $code"
+                echo "Health $i -> $code"
                 [ "$code" = "200" ] && exit 0
                 sleep 5
               done
 
-              echo "Logs do container:"
               az container logs -g $(resourceGroup) -n $(appName) || true
               exit 1
