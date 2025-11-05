@@ -1,10 +1,8 @@
-# Etapa de build (gradle wrapper)
 FROM gradle:8.7.0-jdk21 AS build
 WORKDIR /usr/app
 COPY . .
 RUN chmod +x ./gradlew && ./gradlew bootJar -x test
 
-# Runtime leve
 FROM eclipse-temurin:21-jre
 WORKDIR /app
 COPY --from=build /usr/app/build/libs/*.jar app.jar
