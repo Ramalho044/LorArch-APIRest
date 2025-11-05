@@ -25,13 +25,14 @@ public class SecurityConfig {
     public UserDetailsService userDetailsService(DataSource ds) {
         JdbcUserDetailsManager mgr = new JdbcUserDetailsManager(ds);
         mgr.setUsersByUsernameQuery(
-                "SELECT username, password, enabled FROM APP_USERS WHERE username=?");
+                "SELECT USERNAME, PASSWORD, ENABLED FROM RM558024.APP_USERS WHERE USERNAME=?"
+        );
         mgr.setAuthoritiesByUsernameQuery(
-                "SELECT u.username, r.name AS authority " +
-                        "FROM APP_USERS u " +
-                        "JOIN APP_USER_ROLES ur ON ur.USER_ID=u.ID " +
-                        "JOIN APP_ROLES r ON r.ID=ur.ROLE_ID " +
-                        "WHERE u.username=?");
+                "SELECT u.USERNAME, r.NAME AS AUTHORITY " +
+                        "FROM RM558024.APP_USERS u " +
+                        "JOIN RM558024.APP_USER_ROLES ur ON ur.USER_ID=u.ID " +
+                        "JOIN RM558024.APP_ROLES r ON r.ID=ur.ROLE_ID " +
+                        "WHERE u.USERNAME=?");
         return mgr;
     }
 
