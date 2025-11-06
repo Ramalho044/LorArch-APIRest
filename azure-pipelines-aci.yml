@@ -1,7 +1,4 @@
-# ==============================
-# LORARCH - PIPELINE CI/CD FINAL
-# Sprint 4 | FIAP DevOps & Cloud
-# ==============================
+
 
 trigger:
   branches:
