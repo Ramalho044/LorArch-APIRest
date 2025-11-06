@@ -1,1 +1,1 @@
-rootProject.name = "LorArch"
+rootProject.name = "LorArch-APIRest"
