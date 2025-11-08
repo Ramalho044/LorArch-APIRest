@@ -1,20 +1,34 @@
-# Etapa 1: Build
-FROM gradle:8.7.0-jdk21 AS build
-WORKDIR /usr/app
-COPY . .
-RUN chmod +x ./gradlew && ./gradlew clean bootJar -x test
+# =========================
+# STAGE 1 - BUILD (Gradle)
+# =========================
+FROM eclipse-temurin:21-jdk AS build
 
-# Etapa 2: Runtime
+WORKDIR /usr/app
+
+# Copia tudo pro container
+COPY . .
+
+# Garante que o gradlew é executável
+RUN chmod +x ./gradlew
+
+# Gera o JAR
+RUN ./gradlew clean bootJar --no-daemon
+
+# Renomeia o JAR gerado para app.jar (é isso que o stage final espera)
+RUN cp build/libs/*.jar build/libs/app.jar
+
+# =========================
+# STAGE 2 - RUNTIME
+# =========================
 FROM eclipse-temurin:21-jre
+
 WORKDIR /app
+
+# Copia o JAR pronto do stage de build
 COPY --from=build /usr/app/build/libs/app.jar /app/app.jar
+
+# Porta da aplicação
 EXPOSE 8080
 
-# Variáveis sobrescritas no ACI
-ENV SERVER_PORT=8080
-ENV SPRING_DATASOURCE_URL=""
-ENV SPRING_DATASOURCE_USERNAME=""
-ENV SPRING_DATASOURCE_PASSWORD=""
-ENV SPRING_JPA_HIBERNATE_DDL_AUTO=validate
-
-ENTRYPOINT ["java","-jar","/app/app.jar"]
+# Nada de senha de banco aqui. Isso vai por variável de ambiente no ACI.
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
