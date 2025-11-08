@@ -2,6 +2,7 @@ plugins {
     java
     id("org.springframework.boot") version "3.2.5"
     id("io.spring.dependency-management") version "1.1.4"
+    id("jacoco")
 }
 
 group = "com.lorarch"
@@ -41,9 +42,23 @@ dependencies {
     // Front (se estiver usando)
     implementation("org.webjars:bootstrap:5.3.3")
 
+    // Testes
     testImplementation("org.springframework.boot:spring-boot-starter-test")
 }
 
 tasks.withType<Test> {
     useJUnitPlatform()
+}
+
+// Jacoco: gerar relatório depois dos testes
+tasks.test {
+    finalizedBy(tasks.jacocoTestReport)
+}
+
+tasks.jacocoTestReport {
+    dependsOn(tasks.test)
+    reports {
+        xml.required.set(true)   // gera build/reports/jacoco/test/jacocoTestReport.xml
+        html.required.set(true)  // relatórios em HTML
+    }
 }
