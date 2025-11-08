@@ -26,6 +26,11 @@ variables:
   azureServiceConnection: 'sc-azure-lorch'
 
 # ========================================================
+# ✅ STAGES
+# ========================================================
+stages:
+
+# ========================================================
 #  STAGE 1 - CI: BUILD + TEST + DOCKER BUILD & PUSH
 # ========================================================
 - stage: CI
@@ -34,11 +39,12 @@ variables:
     - job: build
       displayName: 'Job: Build & Test Java'
       steps:
-        # 1) Checkout do repo
+
+        # 1️⃣ Checkout do repositório
         - checkout: self
           fetchDepth: 1
 
-        # 2) Java 21
+        # 2️⃣ Instalar Java 21
         - task: JavaToolInstaller@0
           displayName: 'Instalar Java 21'
           inputs:
@@ -46,7 +52,7 @@ variables:
             jdkArchitectureOption: 'x64'
             jdkSourceOption: 'PreInstalled'
 
-        # 3) Cache do Gradle
+        # 3️⃣ Cache do Gradle
         - task: Cache@2
           displayName: 'Cache Gradle'
           inputs:
@@ -54,14 +60,12 @@ variables:
             restoreKeys: gradle | "$(Agent.OS)"
             path: ~/.gradle
 
-        # 4) Subir SQL Server em Docker para os testes
+        # 4️⃣ Subir SQL Server no container para testes
         - bash: |
             set -euo pipefail
-
-            echo "Limpando container antigo..."
             docker rm -f mssql_ci 2>/dev/null || true
 
-            echo "Subindo SQL Server 2022..."
+            echo "Subindo SQL Server local para testes..."
             docker run -d --name mssql_ci \
               -e 'ACCEPT_EULA=Y' \
               -e 'MSSQL_SA_PASSWORD=Str0ng_Passw0rd!' \
@@ -79,17 +83,16 @@ variables:
             done
 
             echo "Descobrindo caminho do sqlcmd..."
-            SQLCMD_PATH=$(docker exec mssql_ci bash -lc 'command -v /opt/mssql-tools/bin/sqlcmd || command -v /opt/mssql-tools18/bin/sqlcmd')
+            SQLCMD_PATH=$(docker exec mssql_ci bash -lc 'command -v /opt/mssql-tools18/bin/sqlcmd || command -v /opt/mssql-tools/bin/sqlcmd')
             echo "sqlcmd em: ${SQLCMD_PATH}"
 
-            echo "Criando banco lorarch_ci (se não existir)..."
-            # -C = ignora verificação de certificado (é isso que você chamou de "tirar verificação")
+            echo "Criando banco lorarch_ci..."
             docker exec mssql_ci ${SQLCMD_PATH} -C \
               -S localhost -U sa -P 'Str0ng_Passw0rd!' \
               -Q "IF DB_ID('lorarch_ci') IS NULL CREATE DATABASE lorarch_ci;"
-          displayName: 'Subir SQL Server (CI) — com espera e sem frescura de certificado'
+          displayName: 'Subir SQL Server (CI) — com espera e sem SSL chato'
 
-        # 5) Rodar testes (usando o SQL Server do container)
+        # 5️⃣ Rodar testes unitários (com banco local)
         - script: ./gradlew clean test --no-daemon
           displayName: 'Rodar Testes'
           env:
@@ -97,7 +100,7 @@ variables:
             SPRING_DATASOURCE_USERNAME: 'sa'
             SPRING_DATASOURCE_PASSWORD: 'Str0ng_Passw0rd!'
 
-        # 6) Publicar resultados dos testes (JUnit)
+        # 6️⃣ Publicar resultados dos testes (JUnit)
         - task: PublishTestResults@2
           displayName: 'Publicar resultados de teste'
           inputs:
@@ -106,11 +109,11 @@ variables:
             searchFolder: '$(System.DefaultWorkingDirectory)'
             failTaskOnFailedTests: true
 
-        # 7) Gerar JAR
+        # 7️⃣ Gerar artefato JAR
         - script: ./gradlew bootJar --no-daemon
           displayName: 'Gerar artefato JAR'
 
-        # 8) Jogar o JAR para a pasta drop/app.jar
+        # 8️⃣ Copiar JAR para a pasta drop
         - bash: |
             set -e
             JAR=$(ls build/libs/*.jar | head -n1)
@@ -125,7 +128,7 @@ variables:
             pathToPublish: 'drop'
             artifactName: 'drop'
 
-        # 9) Build & push da imagem Docker pro ACR
+        # 9️⃣ Build e Push da imagem Docker para o ACR
         - task: Docker@2
           displayName: 'Build & Push da imagem Docker → ACR'
           inputs:
