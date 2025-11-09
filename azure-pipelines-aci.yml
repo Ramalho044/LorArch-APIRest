@@ -25,21 +25,19 @@ variables:
   dockerRegistryServiceConnection: 'sc-acr-lorch'
   azureServiceConnection: 'sc-azure-lorch'
 
-stages:
 # ========================================================
 #  STAGE 1 - CI: BUILD, TEST, JACOCO, DOCKER BUILD & PUSH
 # ========================================================
+stages:
 - stage: CI
   displayName: 'CI — Build, Test, Docker build & Push'
   jobs:
   - job: build
     displayName: 'Job: Build & Test Java'
     steps:
-      # Checkout do repositório
       - checkout: self
         fetchDepth: 1
 
-      # Instalar Java 21
       - task: JavaToolInstaller@0
         displayName: 'Instalar Java 21'
         inputs:
@@ -47,7 +45,6 @@ stages:
           jdkArchitectureOption: 'x64'
           jdkSourceOption: 'PreInstalled'
 
-      # Cache Gradle
       - task: Cache@2
         displayName: 'Cache Gradle'
         inputs:
@@ -56,11 +53,9 @@ stages:
             gradle | "$(Agent.OS)"
           path: ~/.gradle
 
-      # Dar permissão de execução pro gradlew
       - script: chmod +x ./gradlew
         displayName: 'Permitir execução do gradlew'
 
-      # Testes + Jacoco
       - script: ./gradlew clean test jacocoTestReport --no-daemon
         displayName: 'Rodar Testes + Jacoco'
 
@@ -80,11 +75,9 @@ stages:
           reportDirectory: '$(System.DefaultWorkingDirectory)/**/build/reports/jacoco/test/html'
           failIfCoverageEmpty: false
 
-      # Build do JAR
       - script: ./gradlew bootJar --no-daemon
         displayName: 'Gerar artefato JAR'
 
-      # Copiar o JAR para a pasta drop
       - bash: |
           set -e
           JAR=$(ls build/libs/*.jar | head -n1)
@@ -98,7 +91,6 @@ stages:
           pathToPublish: 'drop'
           artifactName: 'drop'
 
-      # Build & push da imagem Docker pro ACR
       - task: Docker@2
         displayName: 'Build & Push da imagem Docker → ACR'
         inputs:
@@ -132,6 +124,10 @@ stages:
           inlineScript: |
             set -e
 
+            # Buscar credenciais do ACR automaticamente
+            ACR_USERNAME=$(az acr credential show -n "$(acrName)" --query "username" -o tsv)
+            ACR_PASSWORD=$(az acr credential show -n "$(acrName)" --query "passwords[0].value" -o tsv)
+
             IMAGE="$(acrLoginServer)/$(imageRepository):$(Build.BuildId)"
             DNS_LABEL="$(echo $(appName) | tr '[:upper:]' '[:lower:]')"
 
@@ -156,8 +152,8 @@ stages:
               --ports 8080 \
               --dns-name-label "$DNS_LABEL" \
               --registry-login-server "$(acrLoginServer)" \
-              --registry-username "$(ACR_USERNAME)" \
-              --registry-password "$(ACR_PASSWORD)" \
+              --registry-username "$ACR_USERNAME" \
+              --registry-password "$ACR_PASSWORD" \
               --restart-policy Always \
               --environment-variables \
                   SPRING_PROFILES_ACTIVE=prod \
@@ -180,6 +176,4 @@ stages:
             FQDN=$(az container show -g "$(resourceGroup)" -n "$(appName)" --query "ipAddress.fqdn" -o tsv)
             echo "Container criado. Quando a aplicação estiver de pé, use: http://$FQDN:8080"
 
-            # Sem health-check nem logs extras, pra não quebrar a pipeline
             echo "Deploy finalizado (sem health-check automático)."
-
