@@ -1,11 +1,10 @@
-# Usar apenas a JRE (runtime)
+# Imagem runtime Java 21
 FROM eclipse-temurin:21-jre
 
 WORKDIR /app
 
-# O pipeline copia o JAR para drop/app.jar e depois faz docker build na raiz,
-# então basta copiar o JAR gerado em build/libs (já presente no workspace).
-COPY build/libs/*.jar /app/app.jar
+# Copia o JAR GERADO PELO GRADLE NA PIPELINE
+COPY build/libs/*.jar app.jar
 
 EXPOSE 8080
 
