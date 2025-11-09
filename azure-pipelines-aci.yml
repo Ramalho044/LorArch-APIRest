@@ -27,7 +27,7 @@ variables:
 
 stages:
 # ========================================================
-#  STAGE 1 - CI: Build, Test (não quebrar), Docker build & push
+#  STAGE 1 - CI: Build, Test (não travar), Docker build & push
 # ========================================================
 - stage: CI
   displayName: 'CI — Build, Test (sem travar), Docker build & push'
@@ -35,11 +35,9 @@ stages:
     - job: build
       displayName: 'Job: Build & Test Java'
       steps:
-        # Checkout
         - checkout: self
           fetchDepth: 1
 
-        # Java 21
         - task: JavaToolInstaller@0
           displayName: 'Instalar Java 21'
           inputs:
@@ -47,11 +45,9 @@ stages:
             jdkArchitectureOption: 'x64'
             jdkSourceOption: 'PreInstalled'
 
-        # Garantir permissão no gradlew
         - script: chmod +x gradlew
           displayName: 'Dar permissão de execução ao gradlew'
 
-        # Cache Gradle
         - task: Cache@2
           displayName: 'Cache Gradle'
           inputs:
@@ -59,9 +55,7 @@ stages:
             restoreKeys: gradle | "$(Agent.OS)"
             path: ~/.gradle
 
-        # =======================================
-        # Subir SQL Server 2022 para testes de integração
-        # =======================================
+        # ================= SQL Server para testes =================
         - bash: |
             set -euo pipefail
 
@@ -90,9 +84,7 @@ stages:
           failOnStderr: false
           continueOnError: true
 
-        # ===================================
-        # Testes + Jacoco (NÃO quebrar a pipeline)
-        # ===================================
+        # ================= Testes + Jacoco (não matar pipeline) =================
         - script: |
             set -e
             echo "Rodando testes com profile CI..."
@@ -102,7 +94,7 @@ stages:
             SPRING_PROFILES_ACTIVE='ci' \
             ./gradlew clean test jacocoTestReport --no-daemon || true
 
-            echo "Saída dos testes acima. Mesmo que algum falhe, não vamos matar o build."
+            echo "Mesmo que tenha teste falhando, não vamos quebrar o job."
           displayName: 'Rodar Testes + Jacoco (não falhar se teste quebrar)'
           continueOnError: true
 
@@ -122,14 +114,10 @@ stages:
             reportDirectory: '$(System.DefaultWorkingDirectory)/**/build/reports/jacoco/test/html'
             failIfCoverageEmpty: false
 
-        # ===================================
-        # Build do .jar
-        # ===================================
-        - script: |
-            ./gradlew bootJar --no-daemon
+        # ================= Build JAR =================
+        - script: ./gradlew bootJar --no-daemon
           displayName: 'Gerar artefato JAR'
 
-        # Copiar JAR para pasta drop/app.jar
         - bash: |
             set -e
             JAR=$(ls build/libs/*.jar | head -n1)
@@ -138,16 +126,13 @@ stages:
             echo "Usando JAR: $JAR"
           displayName: 'Preparar artefato para Docker'
 
-        # Publicar artefato (só pra ficar bonitinho no DevOps)
         - task: PublishBuildArtifacts@1
           displayName: 'Publicar artefato (drop)'
           inputs:
             pathToPublish: 'drop'
             artifactName: 'drop'
 
-        # ===================================
-        # Build & Push Docker → ACR
-        # ===================================
+        # ================= Docker build & push =================
         - task: Docker@2
           displayName: 'Build & Push da imagem Docker → ACR'
           inputs:
@@ -209,6 +194,7 @@ stages:
                 --restart-policy Always \
                 --ports 8080 \
                 --dns-name-label ${DNS_LABEL} \
+                --os-type Linux \
                 --registry-login-server $(acrLoginServer) \
                 --registry-username "$ACR_USER" \
                 --registry-password "$ACR_PASS" \
