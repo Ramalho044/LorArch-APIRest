@@ -30,16 +30,20 @@ stages:
 #  STAGE 1 - CONTÍNUOUS INTEGRATION (BUILD + TEST + PUSH)
 # ========================================================
 - stage: CI
-  displayName: 'CI — Build, Test, Jacoco, Docker build & Push'
+  displayName: 'CI — Build, Test, Jacoco, Docker build & push'
   jobs:
     - job: build
       displayName: 'Job: Build & Test Java'
       steps:
-        # Checkout do repositório
+        # ---------------------------------
+        # Checkout
+        # ---------------------------------
         - checkout: self
           fetchDepth: 1
 
+        # ---------------------------------
         # Java 21
+        # ---------------------------------
         - task: JavaToolInstaller@0
           displayName: 'Instalar Java 21'
           inputs:
@@ -47,16 +51,25 @@ stages:
             jdkArchitectureOption: 'x64'
             jdkSourceOption: 'PreInstalled'
 
-        # Cache Gradle
+        # ---------------------------------
+        # Permissão no gradlew (erro 126)
+        # ---------------------------------
+        - script: chmod +x ./gradlew
+          displayName: 'Dar permissão de execução ao gradlew'
+
+        # ---------------------------------
+        # Cache Gradle (não falhar se der ruim)
+        # ---------------------------------
         - task: Cache@2
           displayName: 'Cache Gradle'
+          continueOnError: true
           inputs:
             key: 'gradle | "$(Agent.OS)" | **/gradle-wrapper.properties'
             restoreKeys: gradle | "$(Agent.OS)"
             path: ~/.gradle
 
         # =======================================
-        # Subir SQL Server real para os testes CI
+        # Subir SQL Server 2022 para os testes CI
         # =======================================
         - bash: |
             set -euo pipefail
@@ -85,7 +98,7 @@ stages:
             echo "sqlcmd em: ${SQLCMD_PATH}"
 
             echo "Criando banco lorarch_ci (se não existir)..."
-            # IMPORTANTE: -C para confiar no certificado (driver 18 exige isso)
+            # -C = confiar no certificado (ODBC 18 enche o saco com SSL)
             docker exec mssql_ci ${SQLCMD_PATH} \
               -S localhost -U sa -P 'Str0ng_Passw0rd!' -C \
               -Q "IF DB_ID('lorarch_ci') IS NULL CREATE DATABASE lorarch_ci;"
@@ -93,7 +106,7 @@ stages:
           displayName: 'Subir SQL Server (CI) — com espera'
 
         # ===================================
-        # Testes e cobertura
+        # Testes + Jacoco
         # ===================================
         - script: ./gradlew clean test jacocoTestReport --no-daemon
           displayName: 'Rodar Testes + Jacoco'
@@ -106,14 +119,14 @@ stages:
             testResultsFormat: 'JUnit'
             testResultsFiles: '**/TEST-*.xml'
             searchFolder: '$(System.DefaultWorkingDirectory)'
-            failTaskOnFailedTests: false
+            failTaskOnFailedTests: true   # se algum teste falhar, o job falha (comportamento certo)
 
         - task: PublishCodeCoverageResults@2
           displayName: 'Publicar relatório Jacoco'
           inputs:
             codeCoverageTool: 'JaCoCo'
-            summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/jacocoTestReport.xml'
-            reportDirectory: '$(System.DefaultWorkingDirectory)/**/jacoco/test/html'
+            summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/build/reports/jacoco/test/jacocoTestReport.xml'
+            reportDirectory: '$(System.DefaultWorkingDirectory)/**/build/reports/jacoco/test/html'
             failIfCoverageEmpty: false
 
         # ===================================
@@ -125,9 +138,10 @@ stages:
         - bash: |
             set -e
             JAR=$(ls build/libs/*.jar | head -n1)
+            echo "Encontrado JAR: $JAR"
             mkdir -p drop
             cp "$JAR" drop/app.jar
-          displayName: 'Preparar artefato para Docker'
+          displayName: 'Preparar artefato para Docker (drop/app.jar)'
 
         - task: PublishBuildArtifacts@1
           displayName: 'Publicar artefato (drop)'
@@ -136,7 +150,7 @@ stages:
             artifactName: 'drop'
 
         # ===================================
-        # Build e push da imagem Docker pro ACR
+        # Build & Push Docker → ACR
         # ===================================
         - task: Docker@2
           displayName: 'Build & Push da imagem Docker → ACR'
@@ -174,12 +188,15 @@ stages:
               IMAGE="$(acrLoginServer)/$(imageRepository):$(Build.BuildId)"
               DNS_LABEL="$(echo $(appName) | tr '[:upper:]' '[:lower:]')"
 
-              echo "Criando/atualizando container $(appName)..."
+              echo "Usando imagem: $IMAGE"
+              echo "DNS label: $DNS_LABEL"
 
+              echo "Apagando container antigo (se existir)..."
               if az container show -g $(resourceGroup) -n $(appName) &>/dev/null; then
                 az container delete -g $(resourceGroup) -n $(appName) --yes
               fi
 
+              echo "Criando container no ACI..."
               az container create \
                 --name $(appName) \
                 --resource-group $(resourceGroup) \
@@ -195,6 +212,19 @@ stages:
                 --registry-password $(ACR_PASS) \
                 --environment-variables \
                     SPRING_PROFILES_ACTIVE=prod \
-                    SERVER_PORT=8080
+                    SERVER_PORT=8080 \
+                --secure-environment-variables \
+                    SPRING_DATASOURCE_URL=$(DB_URL) \
+                    SPRING_DATASOURCE_USERNAME=$(DB_USER) \
+                    SPRING_DATASOURCE_PASSWORD=$(DB_PASSWORD)
 
-              echo "Container criado/atualizado."
+              echo "Container criado. Verificando estado..."
+              for i in {1..40}; do
+                STATE=$(az container show -g $(resourceGroup) -n $(appName) --query "instanceView.state" -o tsv)
+                echo "Estado: $STATE"
+                [ "$STATE" = "Running" ] && break
+                sleep 6
+              done
+
+              FQDN=$(az container show -g $(resourceGroup) -n $(appName) --query "ipAddress.fqdn" -o tsv)
+              echo "Aplicação (teoricamente) disponível em: http://$FQDN:8080"
