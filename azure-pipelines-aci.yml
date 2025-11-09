@@ -26,7 +26,7 @@ variables:
   azureServiceConnection: 'sc-azure-lorch'
 
 # ========================================================
-# ✅ STAGES
+# STAGES
 # ========================================================
 stages:
 
@@ -52,7 +52,7 @@ stages:
             jdkArchitectureOption: 'x64'
             jdkSourceOption: 'PreInstalled'
 
-        # 3️⃣ Cache do Gradle
+        # 3️⃣ Cache Gradle
         - task: Cache@2
           displayName: 'Cache Gradle'
           inputs:
@@ -60,12 +60,16 @@ stages:
             restoreKeys: gradle | "$(Agent.OS)"
             path: ~/.gradle
 
-        # 4️⃣ Subir SQL Server no container para testes
+        # 4️⃣ Permitir execução do gradlew (corrige erro 126)
+        - bash: chmod +x gradlew
+          displayName: 'Permitir execução do Gradle Wrapper'
+
+        # 5️⃣ Subir SQL Server no container local (para testes)
         - bash: |
             set -euo pipefail
             docker rm -f mssql_ci 2>/dev/null || true
 
-            echo "Subindo SQL Server local para testes..."
+            echo "Subindo SQL Server para testes locais..."
             docker run -d --name mssql_ci \
               -e 'ACCEPT_EULA=Y' \
               -e 'MSSQL_SA_PASSWORD=Str0ng_Passw0rd!' \
@@ -75,24 +79,21 @@ stages:
             echo "Esperando SQL iniciar..."
             for i in {1..30}; do
               if docker logs mssql_ci 2>&1 | grep -q "SQL Server is now ready for client connections"; then
-                echo "SQL pronto."
+                echo "✅ SQL pronto."
                 break
               fi
               sleep 5
-              echo "aguardando... $i"
+              echo "Aguardando... $i"
             done
 
-            echo "Descobrindo caminho do sqlcmd..."
+            echo "Configurando banco lorarch_ci..."
             SQLCMD_PATH=$(docker exec mssql_ci bash -lc 'command -v /opt/mssql-tools18/bin/sqlcmd || command -v /opt/mssql-tools/bin/sqlcmd')
-            echo "sqlcmd em: ${SQLCMD_PATH}"
-
-            echo "Criando banco lorarch_ci..."
             docker exec mssql_ci ${SQLCMD_PATH} -C \
               -S localhost -U sa -P 'Str0ng_Passw0rd!' \
               -Q "IF DB_ID('lorarch_ci') IS NULL CREATE DATABASE lorarch_ci;"
-          displayName: 'Subir SQL Server (CI) — com espera e sem SSL chato'
+          displayName: 'Subir SQL Server (CI) — sem SSL'
 
-        # 5️⃣ Rodar testes unitários (com banco local)
+        # 6️⃣ Rodar testes unitários
         - script: ./gradlew clean test --no-daemon
           displayName: 'Rodar Testes'
           env:
@@ -100,7 +101,7 @@ stages:
             SPRING_DATASOURCE_USERNAME: 'sa'
             SPRING_DATASOURCE_PASSWORD: 'Str0ng_Passw0rd!'
 
-        # 6️⃣ Publicar resultados dos testes (JUnit)
+        # 7️⃣ Publicar resultados de teste (JUnit)
         - task: PublishTestResults@2
           displayName: 'Publicar resultados de teste'
           inputs:
@@ -109,11 +110,11 @@ stages:
             searchFolder: '$(System.DefaultWorkingDirectory)'
             failTaskOnFailedTests: true
 
-        # 7️⃣ Gerar artefato JAR
+        # 8️⃣ Gerar artefato JAR
         - script: ./gradlew bootJar --no-daemon
           displayName: 'Gerar artefato JAR'
 
-        # 8️⃣ Copiar JAR para a pasta drop
+        # 9️⃣ Preparar artefato para Docker
         - bash: |
             set -e
             JAR=$(ls build/libs/*.jar | head -n1)
@@ -122,13 +123,14 @@ stages:
             cp "$JAR" drop/app.jar
           displayName: 'Preparar artefato para Docker'
 
+        # 🔟 Publicar artefato
         - task: PublishBuildArtifacts@1
           displayName: 'Publicar artefato (drop)'
           inputs:
             pathToPublish: 'drop'
             artifactName: 'drop'
 
-        # 9️⃣ Build e Push da imagem Docker para o ACR
+        # 11️⃣ Build e Push da imagem Docker para o ACR
         - task: Docker@2
           displayName: 'Build & Push da imagem Docker → ACR'
           inputs:
@@ -153,6 +155,7 @@ stages:
     - job: deploy
       displayName: 'Job: Deploy ACI'
       steps:
+
         - task: AzureCLI@2
           displayName: 'Criar / Atualizar Container no ACI'
           inputs:
@@ -165,14 +168,13 @@ stages:
               IMAGE="$(acrLoginServer)/$(imageRepository):$(Build.BuildId)"
               DNS_LABEL="$(echo $(appName) | tr '[:upper:]' '[:lower:]')"
 
-              echo "Imagem que será usada: $IMAGE"
+              echo "Criando container $appName com imagem $IMAGE..."
 
               if az container show -g $(resourceGroup) -n $(appName) &>/dev/null; then
-                echo "Container já existe. Deletando..."
+                echo "Container existente. Deletando..."
                 az container delete -g $(resourceGroup) -n $(appName) --yes
               fi
 
-              echo "Criando container no ACI..."
               az container create \
                 --name $(appName) \
                 --resource-group $(resourceGroup) \
@@ -202,14 +204,14 @@ stages:
               FQDN=$(az container show -g $(resourceGroup) -n $(appName) --query "ipAddress.fqdn" -o tsv)
               echo "Aplicação disponível em: http://$FQDN:8080"
 
-              echo "Health-check em /actuator/health..."
+              echo "Validando health-check..."
               for i in {1..30}; do
                 code=$(curl -s -o /dev/null -w "%{http_code}" "http://$FQDN:8080/actuator/health" || true)
                 echo "Tentativa $i -> HTTP $code"
-                [ "$code" = "200" ] && echo "Health OK!" && exit 0
+                [ "$code" = "200" ] && echo "✅ Health OK!" && exit 0
                 sleep 5
               done
 
-              echo "Health não ficou 200. Últimos logs:"
-              az container logs -g $(resourceGroup) -n $(appName) --tail 100 || true
+              echo "⚠️ Health não ficou 200. Logs recentes:"
+              az container logs -g $(resourceGroup) -n $(appName) --tail 50 || true
               exit 1
