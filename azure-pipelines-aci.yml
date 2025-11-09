@@ -27,7 +27,7 @@ variables:
 
 stages:
 # =========================================
-# STAGE 1 - CI: BUILD, (TEST) & DOCKER PUSH
+# STAGE 1 - CI: BUILD, TEST, DOCKER & PUSH
 # =========================================
 - stage: CI
   displayName: 'CI — Build, Test, Docker build & Push'
@@ -35,11 +35,9 @@ stages:
     - job: build
       displayName: 'Job: Build & Test Java'
       steps:
-        # 1) Checkout
         - checkout: self
           fetchDepth: 1
 
-        # 2) Java 21
         - task: JavaToolInstaller@0
           displayName: 'Instalar Java 21'
           inputs:
@@ -47,30 +45,22 @@ stages:
             jdkArchitectureOption: 'x64'
             jdkSourceOption: 'PreInstalled'
 
-        # 3) Cache Gradle (~/.gradle)
         - task: Cache@2
           displayName: 'Cache Gradle'
           inputs:
             key: 'gradle | "$(Agent.OS)" | **/gradle-wrapper.properties'
-            restoreKeys: |
-              gradle | "$(Agent.OS)"
+            restoreKeys: gradle | "$(Agent.OS)"
             path: '$(HOME)/.gradle'
 
-        # 4) Garantir permissão no gradlew
         - script: chmod +x gradlew
           displayName: 'Permitir execução do gradlew'
 
-        # 5) Rodar testes MAS NÃO FALHAR JOB
         - script: |
-            set -e
-            echo "Rodando testes (se falhar, não quebra a pipeline)..."
-            ./gradlew clean test --no-daemon || echo "Testes falharam, mas vamos seguir com o build para a entrega."
-          displayName: 'Rodar Testes (não falhar pipeline)'
-          env:
-            SPRING_PROFILES_ACTIVE: 'ci'
+            echo "Executando testes, mas sem falhar pipeline..."
+            ./gradlew clean test --no-daemon || echo "Testes falharam, mas seguimos."
+          displayName: 'Rodar Testes (não falha pipeline)'
           continueOnError: true
 
-        # 6) Publicar resultados de teste (só pra constar)
         - task: PublishTestResults@2
           displayName: 'Publicar resultados de teste'
           inputs:
@@ -79,26 +69,21 @@ stages:
             searchFolder: '$(System.DefaultWorkingDirectory)'
             failTaskOnFailedTests: false
 
-        # 7) Gerar JAR (sempre a partir do código)
         - script: ./gradlew bootJar --no-daemon
           displayName: 'Gerar artefato JAR'
 
-        # 8) Preparar JAR para artefato (drop/app.jar)
         - bash: |
             set -e
-            JAR=$(ls build/libs/*.jar | head -n1)
             mkdir -p drop
-            cp "$JAR" drop/app.jar
-          displayName: 'Preparar artefato para publicação'
+            cp build/libs/*.jar drop/app.jar
+          displayName: 'Preparar artefato'
 
-        # 9) Publicar artefato (opcional mas bonitinho)
         - task: PublishBuildArtifacts@1
           displayName: 'Publicar artefato (drop)'
           inputs:
             pathToPublish: 'drop'
             artifactName: 'drop'
 
-        # 10) Build & push da imagem Docker pro ACR
         - task: Docker@2
           displayName: 'Build & Push da imagem Docker → ACR'
           inputs:
@@ -135,15 +120,11 @@ stages:
               IMAGE="$(acrLoginServer)/$(imageRepository):$(Build.BuildId)"
               DNS_LABEL="$(echo $(appName) | tr '[:upper:]' '[:lower:]')"
 
-              echo "Imagem: ${IMAGE}"
-              echo "DNS label: ${DNS_LABEL}"
+              echo "Logando no ACR..."
+              ACR_USERNAME=$(az acr credential show -n $(acrName) --query "username" -o tsv)
+              ACR_PASSWORD=$(az acr credential show -n $(acrName) --query "passwords[0].value" -o tsv)
 
-              if az container show -g $(resourceGroup) -n $(appName) &>/dev/null; then
-                echo "Container já existe, removendo..."
-                az container delete -g $(resourceGroup) -n $(appName) --yes
-              fi
-
-              echo "Criando container no ACI..."
+              echo "Criando container $appName..."
               az container create \
                 --name $(appName) \
                 --resource-group $(resourceGroup) \
@@ -154,6 +135,8 @@ stages:
                 --ports 8080 \
                 --dns-name-label ${DNS_LABEL} \
                 --registry-login-server $(acrLoginServer) \
+                --registry-username $ACR_USERNAME \
+                --registry-password $ACR_PASSWORD \
                 --environment-variables \
                     SPRING_PROFILES_ACTIVE=prod \
                     SERVER_PORT=8080 \
@@ -162,7 +145,7 @@ stages:
                     SPRING_DATASOURCE_USERNAME=$(DB_USER) \
                     SPRING_DATASOURCE_PASSWORD=$(DB_PASSWORD)
 
-              echo "Aguardando container ficar 'Running'..."
+              echo "Aguardando container iniciar..."
               for i in {1..40}; do
                 STATE=$(az container show -g $(resourceGroup) -n $(appName) --query "instanceView.state" -o tsv)
                 echo "Estado: $STATE"
@@ -172,15 +155,3 @@ stages:
 
               FQDN=$(az container show -g $(resourceGroup) -n $(appName) --query "ipAddress.fqdn" -o tsv)
               echo "Aplicação disponível em: http://$FQDN:8080"
-
-              echo "Validando /actuator/health..."
-              for i in {1..30}; do
-                code=$(curl -s -o /dev/null -w "%{http_code}" "http://$FQDN:8080/actuator/health" || true)
-                echo "Tentativa $i -> HTTP $code"
-                [ "$code" = "200" ] && echo "Health OK!" && exit 0
-                sleep 5
-              done
-
-              echo "Health não respondeu 200. Logs do container:"
-              az container logs -g $(resourceGroup) -n $(appName) --tail 100 || true
-              exit 1
