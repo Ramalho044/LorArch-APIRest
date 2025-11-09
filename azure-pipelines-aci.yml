@@ -4,12 +4,6 @@ trigger:
       - master
       - main
 
-pr:
-  branches:
-    include:
-      - master
-      - main
-
 pool:
   vmImage: 'ubuntu-latest'
 
@@ -26,9 +20,6 @@ variables:
   azureServiceConnection: 'sc-azure-lorch'
 
 stages:
-# ========================================================
-#  STAGE 1 - CONTÍNUOUS INTEGRATION (BUILD + TEST + PUSH)
-# ========================================================
 - stage: CI
   displayName: 'CI — Build, Test, Jacoco, Docker build & Push'
   jobs:
@@ -36,14 +27,12 @@ stages:
       displayName: 'Job: Build & Test Java'
       steps:
         - checkout: self
-          fetchDepth: 1
-
         - task: JavaToolInstaller@0
-          displayName: 'Instalar Java 21'
           inputs:
             versionSpec: '21'
             jdkArchitectureOption: 'x64'
             jdkSourceOption: 'PreInstalled'
+          displayName: 'Instalar Java 21'
 
         - task: Cache@2
           inputs:
@@ -52,60 +41,10 @@ stages:
             path: ~/.gradle
           displayName: 'Cache Gradle'
 
-        # =======================================
-        # Subir SQL Server real para os testes CI
-        # =======================================
-        - bash: |
-            set -euo pipefail
-            docker rm -f mssql_ci 2>/dev/null || true
-
-            echo "Subindo SQL Server 2022 para testes..."
-            docker run -d --name mssql_ci \
-              -e 'ACCEPT_EULA=Y' \
-              -e 'MSSQL_SA_PASSWORD=Str0ng_Passw0rd!' \
-              -p 1433:1433 \
-              mcr.microsoft.com/mssql/server:2022-latest
-
-            echo "Esperando SQL iniciar..."
-            for i in {1..40}; do
-              if docker logs mssql_ci 2>&1 | grep -q "SQL Server is now ready for client connections"; then
-                echo "SQL pronto."
-                break
-              fi
-              sleep 5
-              echo "aguardando... $i"
-            done
-
-            echo "Descobrindo caminho do sqlcmd dentro do container..."
-            SQLCMD_PATH=$(docker exec mssql_ci bash -lc 'command -v /opt/mssql-tools18/bin/sqlcmd || command -v /opt/mssql-tools/bin/sqlcmd || command -v sqlcmd')
-            echo "sqlcmd em: ${SQLCMD_PATH}"
-
-            echo "Criando banco lorarch_ci (se não existir)..."
-            docker exec mssql_ci ${SQLCMD_PATH} \
-              -S localhost -U sa -P 'Str0ng_Passw0rd!' \
-              -Q "IF DB_ID('lorarch_ci') IS NULL CREATE DATABASE lorarch_ci;"
-          displayName: 'Subir SQL Server (CI) — com espera'
-
         - script: ./gradlew clean test jacocoTestReport --no-daemon
-          displayName: 'Rodar Testes + Jacoco'
+          displayName: 'Rodar Testes (sem SQL)'
           env:
             SPRING_PROFILES_ACTIVE: 'ci'
-
-        - task: PublishTestResults@2
-          inputs:
-            testResultsFormat: 'JUnit'
-            testResultsFiles: '**/TEST-*.xml'
-            searchFolder: '$(System.DefaultWorkingDirectory)'
-            failTaskOnFailedTests: false
-          displayName: 'Publicar resultados de teste'
-
-        - task: PublishCodeCoverageResults@2
-          inputs:
-            codeCoverageTool: 'JaCoCo'
-            summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/jacocoTestReport.xml'
-            reportDirectory: '$(System.DefaultWorkingDirectory)/**/jacoco/test/html'
-            failIfCoverageEmpty: false
-          displayName: 'Publicar relatório Jacoco'
 
         - script: ./gradlew bootJar --no-daemon
           displayName: 'Gerar artefato JAR'
@@ -121,10 +60,9 @@ stages:
           inputs:
             pathToPublish: 'drop'
             artifactName: 'drop'
-          displayName: 'Publicar artefato (drop)'
 
         - task: Docker@2
-          displayName: 'Build & Push da imagem Docker → ACR'
+          displayName: 'Build & Push imagem Docker → ACR'
           inputs:
             containerRegistry: '$(dockerRegistryServiceConnection)'
             repository: '$(imageRepository)'
@@ -135,20 +73,15 @@ stages:
               $(Build.BuildId)
               latest
 
-# ========================================================
-#  STAGE 2 - CONTINUOUS DEPLOYMENT (AZURE ACI)
-# ========================================================
 - stage: CD
-  displayName: 'CD — Deploy no Azure Container Instance (ACI)'
+  displayName: 'CD — Deploy no ACI'
   dependsOn: CI
   condition: succeeded()
-
   jobs:
     - job: deploy
-      displayName: 'Job: Deploy ACI'
       steps:
         - task: AzureCLI@2
-          displayName: 'Criar / Atualizar Container no ACI'
+          displayName: 'Deploy container ACI'
           inputs:
             azureSubscription: '$(azureServiceConnection)'
             scriptType: bash
@@ -157,12 +90,6 @@ stages:
               set -e
               IMAGE="$(acrLoginServer)/$(imageRepository):$(Build.BuildId)"
               DNS_LABEL="$(echo $(appName) | tr '[:upper:]' '[:lower:]')"
-
-              echo "Criando/atualizando container $appName..."
-
-              if az container show -g $(resourceGroup) -n $(appName) &>/dev/null; then
-                az container delete -g $(resourceGroup) -n $(appName) --yes
-              fi
 
               az container create \
                 --name $(appName) \
@@ -176,7 +103,4 @@ stages:
                 --dns-name-label ${DNS_LABEL} \
                 --registry-login-server $(acrLoginServer) \
                 --registry-username $(ACR_USER) \
-                --registry-password $(ACR_PASS) \
-                --environment-variables \
-                    SPRING_PROFILES_ACTIVE=prod \
-                    SERVER_PORT=8080
+                --registry-password $(ACR_PASS)
