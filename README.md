@@ -1,5 +1,5 @@
 🧭 Projeto LorArch – API REST e Automação DevOps na Nuvem (Sprint 4 – FIAP)
-👤 Identificação.
+👤 Identificação
 
 Aluno: Marcos Antonio Ramalho Neto
 RM: 556773
